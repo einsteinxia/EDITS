@@ -149,8 +149,7 @@ def initialize_km_models(label_list, args):
     return km_models
 
 def prototype_kmeans_ours(vae, encode_model, processor, data_loader, label_list, km_models, args):
-    "Code is coming soon..."
-        latents = {label: [] for label in label_list} 
+    latents = {label: [] for label in label_list} 
     embeds = {label: [] for label in label_list}
     prompt_to_paths = {label: [] for label in label_list} 
     fuse_feature = {label: [] for label in label_list}
