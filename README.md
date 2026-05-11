@@ -87,6 +87,13 @@ Our code is developed based on the following codebases, thanks for sharing！<br
 
 ## Citation
 If you find this work useful, please consider citing:
-
 ```bibtex
+@inproceedings{xia2026edits,
+  title={EDITS: Enhancing Dataset Distillation with Implicit Textual Semantics},
+  author={Xia, Qianxin and Du, Jiawei and Lu, Guoming and Shu, Zhiyong and Wang, Jielei},
+  booktitle={ICASSP 2026-2026 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
+  pages={6001--6005},
+  year={2026},
+  organization={IEEE}
+}
 
