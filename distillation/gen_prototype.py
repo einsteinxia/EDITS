@@ -150,6 +150,100 @@ def initialize_km_models(label_list, args):
 
 def prototype_kmeans_ours(vae, encode_model, processor, data_loader, label_list, km_models, args):
     "Code is coming soon..."
+        latents = {label: [] for label in label_list} 
+    embeds = {label: [] for label in label_list}
+    prompt_to_paths = {label: [] for label in label_list} 
+    fuse_feature = {label: [] for label in label_list}
+    print('Extracting image and text features for all training data...')
+    for batch_idx, batch in tqdm(enumerate(data_loader), total=len(data_loader), position=0):
+    
+        images = batch['images'].cuda(non_blocking=True)
+        batch_paths = batch['image_paths']
+        labels = batch['labels'].cuda(non_blocking=True)
+        texts = batch['texts']
+        # label_str = batch['label_strs']
+        # indices = batch['indexs']
+        
+        prompts = []
+        
+        for idx, label in enumerate(labels):
+            
+            prompt = label_list[label.item()]
+            prompts.append(prompt)
+            prompt_to_paths[prompt].append(batch_paths[idx])
+
+        
+        # # vae    
+        # init_latents = vae.encode(F.interpolate(images, size=(512, 512), mode='bilinear', align_corners=False)).latent_dist.mean * vae.config.scaling_factor 
+        # # init_latents, init_embeds = pipe(prompt=text_prompt, negative_prompt=[negative_prompt for i in range(len(text_prompt))], image=images, strength=0.7, guidance_scale=8)
+        # # print('init_latents.shape:', init_latents.shape)
+        # # print('init_embeds.shape:', init_embeds.shape)
+
+        # for latent, prompt in zip(init_latents, prompts):
+        #     latents[prompt].append(latent.view(-1).cpu().detach().numpy())
+        
+        # clip
+        init_latents = CLIP_Image_Embeddings(args, images, encode_model, processor)
+        init_embed = CLIP_Text_Embeddings(args, texts, encode_model, processor)
+
+        if args.feature_normlize: 
+            init_latents / np.linalg.norm(init_latents, axis=1, keepdims=True)
+            init_embed / np.linalg.norm(init_embed, axis=1, keepdims=True)
+            
+        for latent, embed, prompt in zip(init_latents, init_embed, prompts):
+            latents[prompt].append(latent)
+            embeds[prompt].append(embed)
+            
+               
+    for prompt in label_list:
+        prompt_latents= latents[prompt]
+        prompt_embeds = embeds[prompt]    
+        
+        # concat_features
+        # fuse_feature[prompt] = np.concatenate([prompt_latents, prompt_embeds], axis=1)
+        
+        # weighted_fuse_features  
+        # prompt_latents = normalize(np.array(prompt_latents), norm='l2')
+        # prompt_latents = normalize(np.array(prompt_embeds), norm='l2')  
+        similarity = np.matmul(np.array(prompt_latents), np.array(prompt_embeds).T)
+        # np.fill_diagonal(similarity, 1.0)
+        similarity = softmax(similarity / args.tau, axis=1)
+        weight_embedding = np.matmul(similarity, prompt_embeds)
+        fuse_feature[prompt] = np.concatenate([prompt_latents, weight_embedding], axis=1)
+    
+    # # only image feature
+    # fuse_feature = latents
+    
+    
+    
+    os.makedirs(args.save_prototype_path, exist_ok=True)
+    json_file = os.path.join(args.save_prototype_path, f'{args.dataset}-ipc{args.ipc}-{args.threshold}-{args.tpk}-kmexpand{args.km_expand}-cluster_all_image_latent.npy')
+    # print('latents:', latents)
+    # print('type(latents):', type(latents))
+    np.save(os.path.join(json_file), fuse_feature, allow_pickle=True)
+    # with open(json_file, 'w') as f:
+    #     # json.dump(convert_to_serializable(latents), f)
+    #     json.dump(latents, f, default=lambda x: x.tolist())
+        # json.dump({k: [arr.tolist() for arr in v] for k, v in latents.items()}, f)
+    print(f"all image latent json file saved ")
+    del init_latents, prompts
+    final_latents = {label: [] for label in label_list}
+    for prompt in label_list:
+        if len(fuse_feature[prompt]) >= args.ipc:
+            if args.contamination == 0:
+                inliers = [True for i in range(len(fuse_feature[prompt]))]
+            else:
+                clf = LocalOutlierFactor(n_neighbors=10, contamination=args.contamination)
+                X_train = np.vstack(fuse_feature[prompt])
+                y_pred = clf.fit_predict(X_train)
+                inliers = y_pred == 1
+            num_false = np.sum(inliers == False)
+            # print(f'-------------{inliers}--------------{len(latents[prompt])}--------------{num_false}')
+            fuse_feature[prompt] = np.array(fuse_feature[prompt])[inliers].tolist()
+            final_latents[prompt] = fuse_feature[prompt].copy()
+            # print(f'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx{len(latents[prompt])}')
+            prompt_to_paths[prompt] = np.array(prompt_to_paths[prompt])[inliers].tolist()
+            km_models[f"KMeans_{prompt}"].fit(np.vstack(fuse_feature.pop(prompt,None)))
 
     return km_models, prompt_to_paths, final_latents
 
@@ -244,7 +338,117 @@ def find_cluster_samples(centers, labels, samples, k_text=None, k_image=None):
     return results
 
 def gen_prototype_ours(label_list, km_models, prompt_to_paths, final_latents, args):
-    "Code is coming soon..."
+    stop_words = set(stopwords.words('english'))
+    # print('prompt_to_paths:', prompt_to_paths)
+    text_dic = {}
+    with open(args.metajson_file, 'r') as f:
+        for line in f:
+            json_data = json.loads(line.strip())
+            file_name = json_data['file_name']
+            text = json_data['text']
+            text_dic[file_name] = text
+    # print('data_dict:', data_dict)
+    image_pro = {}
+    image_multi_pro = {}
+    img_pro_path = {}
+    text_pro = {label: [] for label in label_list}
+    text_multi_pro = {}
+    all_labels = {label: [] for label in label_list}
+    all_path = {label: [] for label in label_list}
+    samples_per_cluster = {}
+    image_multi_pro_path = {label: [] for label in label_list}
+    # api 
+    client = OpenAI(api_key=args.api_key, base_url="https://api.deepseek.com")
+    print("generateing prototype......")
+    for prompt in tqdm(label_list):
+        model_name = f"KMeans_{prompt}"
+        model = km_models.pop(model_name,None)
+        labels = model.labels_
+        all_labels[prompt].append(labels)
+        all_path[prompt].append(prompt_to_paths[prompt])
+        cluster_centers = model.cluster_centers_
+        num_clusters = cluster_centers.shape[0]
+         
+        results = find_cluster_samples(cluster_centers, labels, np.array(final_latents[prompt]), k_text=args.k_text, k_image=args.k_image)
+        
+        closest_indices = list(results['nearest_indices'].values())
+        n_closest_indices_text = list(results['nearest_k_indices_text'].values())
+        n_cluster_centers_text = [value.tolist() for value in results['nearest_k_samples_text'].values()]
+        n_closest_indices_image = list(results['nearest_k_indices_image'].values())
+        n_cluster_centers_image = [value.tolist() for value in results['nearest_k_samples_image'].values()]
+        all_closest_indices = list(results['all_cluster_indices'].values())
+        
+        # image prototype
+        image_pro[prompt] = [cluster_centers[i].tolist() for i in range(num_clusters)] 
+        image_multi_pro[prompt] = [n_cluster_centers_image[i] for i in range(num_clusters)]
+        img_pro_path[prompt] = [prompt_to_paths[prompt][i] for i in closest_indices]
+        image_multi_pro_path[prompt] = [[prompt_to_paths[prompt][idx] for idx in cluster_indices] for cluster_indices in n_closest_indices_image]
+        
+        # text prototype 
+        
+        ## multi-one mapping
+        text_multi_pro_path = [[prompt_to_paths[prompt][idx] for idx in cluster_indices] for cluster_indices in n_closest_indices_text]
+        text_multi_pro[prompt] = [[text_dic.get(f"{os.path.basename(os.path.dirname(path))}/{os.path.basename(path)}", "unknown text") for path in cluster_paths] for cluster_paths in text_multi_pro_path]
+        
+        """Process multiple text groups in batch --> llm api"""
+        for _, texts in enumerate(text_multi_pro[prompt], 1):
+            # print('IMAGENET2012_CLASSES[prompt]:', IMAGENET2012_CLASSES[prompt])
+            llm_prompt = build_prompt(texts, IMAGENET2012_CLASSES[prompt], args.max_tokens)
+            result = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": "You are a professional text analysis expert skilled at extracting core information from multiple texts and generating high-quality representative prototype text. Strictly adhere to token limits."},
+                    {"role": "user", "content": llm_prompt},
+                ],
+                stream=False
+            )
+
+            text_pro[prompt].append(result.choices[0].message.content)       
+
+        # # one-one mapping
+        # text_pro[prompt] = [text_dic[prompt_to_paths[prompt][i].split('train/')[1]] for i in closest_indices]
+   
+    # json_file_cluster_all_latent = os.path.join(args.save_prototype_path, f'{args.dataset}-ipc{args.ipc}-{args.threshold}-{args.tpk}-kmexpand{args.km_expand}-cluster_all_latent.json')
+    # with open(json_file_cluster_all_latent, 'w') as f:
+    #     json.dump(final_latents, f)
+    
+    json_file_cluster_image_pro = os.path.join(args.save_prototype_path, f'{args.dataset}-ipc{args.ipc}-{args.threshold}-{args.tpk}-kmexpand{args.km_expand}-cluster_image_pro.json')
+    with open(json_file_cluster_image_pro, 'w') as f:
+        json.dump(image_pro, f) 
+        
+    # json_file_cluster_image_multi_pro = os.path.join(args.save_prototype_path, f'{args.dataset}-ipc{args.ipc}-{args.threshold}-{args.tpk}-kmexpand{args.km_expand}-cluster_image_multi_pro.json')
+    # with open(json_file_cluster_image_multi_pro, 'w') as f:
+    #     json.dump(image_multi_pro, f)
+    
+    json_file_cluster_image_pro_path = os.path.join(args.save_prototype_path, f'{args.dataset}-ipc{args.ipc}-{args.threshold}-{args.tpk}-kmexpand{args.km_expand}-cluster_image_pro_path.json')
+    with open(json_file_cluster_image_pro_path, 'w') as f:
+        json.dump(img_pro_path, f) 
+        
+    json_file_cluster_image_all_path = os.path.join(args.save_prototype_path, f'{args.dataset}-ipc{args.ipc}-{args.threshold}-{args.tpk}-kmexpand{args.km_expand}-cluster_image_all_path.json')
+    with open(json_file_cluster_image_all_path, 'w') as f:
+        json.dump(image_multi_pro_path, f) 
+        
+    json_file_cluster_text_pro = os.path.join(args.save_prototype_path, f'{args.dataset}-ipc{args.ipc}-{args.threshold}-{args.tpk}-kmexpand{args.km_expand}-cluster_text_pro.json')
+    with open(json_file_cluster_text_pro, 'w') as f:
+        json.dump(text_pro, f) 
+    
+    
+    json_file_all_path = os.path.join(args.save_prototype_path, f'{args.dataset}-ipc{args.ipc}-{args.threshold}-{args.tpk}-kmexpand{args.km_expand}-cluster_all_path.json')
+    with open(json_file_all_path, 'w') as f:
+        json.dump(all_path, f)
+        
+    json_file_cluster_text_multi_pro = os.path.join(args.save_prototype_path, f'{args.dataset}-ipc{args.ipc}-{args.threshold}-{args.tpk}-kmexpand{args.km_expand}-cluster_text_multi_pro.json')
+    with open(json_file_cluster_text_multi_pro, 'w') as f:
+        json.dump(text_multi_pro, f)
+        
+    # json_file_cluster_all_label = os.path.join(args.save_prototype_path, f'{args.dataset}-ipc{args.ipc}-{args.threshold}-{args.tpk}-kmexpand{args.km_expand}-cluster_all_label.json')
+    # with open(json_file_cluster_all_label, 'w') as f:
+    #     json.dump(all_labels, f) 
+        
+    json_file_labels = os.path.join(args.save_prototype_path, f'{args.dataset}-ipc{args.ipc}-{args.threshold}-{args.tpk}-kmexpand{args.km_expand}-cluster_all_labels.npy')
+    np.save(json_file_labels, all_labels, allow_pickle=True) 
+
+    print(f"all image-text-prototype json file saved ")
               
     return image_pro, text_pro
 
